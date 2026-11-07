@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Radio Log
+Comment=SDR and amateur radio contact log
+Exec=radio-log
+Icon=radio-log
+Terminal=false
+Categories=Utility;

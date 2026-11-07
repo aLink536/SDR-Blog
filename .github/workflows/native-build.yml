@@ -1,0 +1,128 @@
+name: Native builds and releases
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths: ['native/**', '.github/workflows/native-build.yml']
+  pull_request:
+    paths: ['native/**', '.github/workflows/native-build.yml']
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Linux build and smoke-test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xauth
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Check release version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo +1.99.1 metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read package version' }
+          $version = ($metadata.packages | Where-Object name -eq 'radio-log').version
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne "v$version") {
+            throw "Tag must match Cargo.toml: expected v$version"
+          }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Tests
+        run: cargo +1.99.1 test --locked
+      - name: Build
+        run: cargo +1.99.1 build --release --locked
+      - name: Linux window startup smoke test
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WINIT_UNIX_BACKEND: x11
+        run: |
+          set +e
+          timeout 15s xvfb-run -a target/release/radio-log --data-dir "$RUNNER_TEMP/radio-log-smoke" > "$RUNNER_TEMP/radio-log-smoke.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/radio-log-smoke.log"
+          if [ "$result" -ne 124 ]; then
+            echo "Expected the window to remain running until timeout; exit was $result"
+            exit 1
+          fi
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          package="radio-log-${APP_VERSION}-linux-x86_64"
+          mkdir -p "dist/$package"
+          cp target/release/radio-log README.md THIRD-PARTY-NOTICES.txt packaging/radio-log.desktop assets/radio-log.png "dist/$package/"
+          mkdir -p "dist/$package/assets"
+          cp assets/LICENSE-TWEMOJI.txt "dist/$package/assets/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/radio-log.exe,README.md,THIRD-PARTY-NOTICES.txt,assets -DestinationPath "dist/radio-log-$env:APP_VERSION-windows-x86_64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: radio-log-${{ matrix.platform }}
+          path: native/dist/*.*
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: radio-log-*
+          merge-multiple: true
+          path: release
+      - name: Publish complete release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          windows="radio-log-${version}-windows-x86_64.zip"
+          linux="radio-log-${version}-linux-x86_64.tar.gz"
+          test -s "$windows"
+          test -s "$linux"
+          sha256sum "$windows" "$linux" > SHA256SUMS.txt
+          # Upload while draft, then publish only after all files are present.
+          # Re-running a failed upload can repair a draft; published releases are immutable here.
+          if gh release view "$TAG" --json isDraft > existing.json 2>/dev/null; then
+            test "$(jq -r .isDraft existing.json)" = true || { echo 'Release already published; use a new version tag.'; exit 1; }
+            gh release upload "$TAG" "$windows" "$linux" SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" "$windows" "$linux" SHA256SUMS.txt --verify-tag --draft --title "Radio Log $TAG" --generate-notes
+          fi
+          if [[ "$version" == *-* ]]; then
+            gh release edit "$TAG" --draft=false --prerelease
+          else
+            gh release edit "$TAG" --draft=false --prerelease=false
+          fi
