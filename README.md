@@ -14,6 +14,9 @@ For SDR++ autofill:
 2. Click **Autofill from SDR++** in Radio Log.
 3. Check the details and suggested type, then save the entry.
 
+   <img width="1334" height="899" alt="image" src="https://github.com/user-attachments/assets/4213e161-a8c6-4ba0-b189-5ba058eb422c" />
+
+
 You can also enter everything by hand. Dates and times are UTC. The location field is for the station you are logging.
 
 ## Your log
