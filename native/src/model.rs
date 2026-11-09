@@ -11,6 +11,34 @@ pub const COLORS: [&str; 8] = [
 pub struct Kind {
     pub name: String,
     pub color: String,
+    /// Optional fields (keys from `FIELDS`) this type does not show in the form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+}
+
+/// Optional form fields a type may hide: (key, label).
+pub const FIELDS: [(&str, &str); 8] = [
+    ("callsign", "Callsign / station"),
+    ("satellite", "Satellite / source"),
+    ("frequency", "Frequency (MHz)"),
+    ("mode", "Mode"),
+    ("rst", "RST sent / received"),
+    ("location", "Station location / grid"),
+    ("recording", "Recording file / link"),
+    ("notes", "Notes"),
+];
+
+impl Kind {
+    pub fn new(name: String, color: String) -> Self {
+        Self {
+            name,
+            color,
+            hidden: vec![],
+        }
+    }
+    pub fn hides(&self, field: &str) -> bool {
+        self.hidden.iter().any(|h| h == field)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -45,15 +73,15 @@ impl Default for Log {
         Self {
             version: 2,
             types: [
-                ("Ham", "emerald"),
-                ("Satellite", "violet"),
-                ("SDR Recording", "amber"),
-                ("Other", "slate"),
+                ("Ham", "emerald", &["satellite", "recording"][..]),
+                ("Satellite", "violet", &["rst", "location"][..]),
+                ("SDR Recording", "amber", &["callsign", "rst"][..]),
+                ("Other", "slate", &[][..]),
             ]
             .into_iter()
-            .map(|(n, c)| Kind {
-                name: n.into(),
-                color: c.into(),
+            .map(|(n, c, hidden)| Kind {
+                hidden: hidden.iter().map(|h| h.to_string()).collect(),
+                ..Kind::new(n.into(), c.into())
             })
             .collect(),
             contacts: vec![],
@@ -223,10 +251,7 @@ impl Log {
             if let Some(t) = log.types.iter().find(|t| key(&t.name) == key(&c.kind)) {
                 c.kind = t.name.clone();
             } else {
-                log.types.push(Kind {
-                    name: c.kind.clone(),
-                    color: "slate".into(),
-                });
+                log.types.push(Kind::new(c.kind.clone(), "slate".into()));
             }
             log.contacts.push(c);
         }

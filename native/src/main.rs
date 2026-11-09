@@ -33,6 +33,7 @@ struct RadioLog {
     exact: Option<(String, String)>,
     pending: Option<Pending>,
     manage: bool,
+    viewing: Option<String>,
     new_type: String,
     new_color: usize,
     rename: Option<(String, String)>,
@@ -58,7 +59,20 @@ impl RadioLog {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        // One control height for buttons, text inputs, combo boxes, etc.
+        style.spacing.interact_size.y = 34.0;
+        style.spacing.combo_height = 300.0;
+        // Standard text 16px, nothing smaller than 14px.
+        use egui::{FontFamily::{Monospace, Proportional}, FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(14.0, Proportional)),
+            (TextStyle::Body, FontId::new(16.0, Proportional)),
+            (TextStyle::Button, FontId::new(16.0, Proportional)),
+            (TextStyle::Heading, FontId::new(24.0, Proportional)),
+            (TextStyle::Monospace, FontId::new(16.0, Monospace)),
+        ]
+        .into();
         style.visuals.selection.bg_fill = Color32::from_rgb(37, 111, 152);
         cc.egui_ctx.set_style(style);
         let (storage, log, blocked, message) = match storage::Storage::open(root) {
@@ -86,6 +100,7 @@ impl RadioLog {
             exact: None,
             pending: None,
             manage: false,
+            viewing: None,
             new_type: String::new(),
             new_color: 0,
             rename: None,
@@ -238,9 +253,50 @@ impl RadioLog {
         }
     }
     fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
-        let label = ui.label(RichText::new(label).small().color(Color32::from_gray(185)));
+        Self::field_suggest(ui, label, value, &[]);
+    }
+    /// Text field that offers previously entered values matching what is being typed.
+    /// Suggestions only help; any value can still be typed.
+    fn field_suggest(ui: &mut egui::Ui, label: &str, value: &mut String, known: &[String]) {
+        let label = ui.label(RichText::new(label).color(Color32::from_gray(185)));
         ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
             .labelled_by(label.id);
+        let typed = value.trim().to_lowercase();
+        if typed.is_empty() {
+            return;
+        }
+        let matches: Vec<&String> = known
+            .iter()
+            .filter(|k| k.as_str() != value.trim() && k.to_lowercase().contains(&typed))
+            .take(5)
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.small("Previously used:");
+            for m in matches {
+                if ui.button(m.as_str()).clicked() {
+                    *value = m.clone();
+                }
+            }
+        });
+    }
+    /// Distinct non-empty values already used for a field, most-used first.
+    fn known_values(&self, get: impl Fn(&Contact) -> &str) -> Vec<String> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for c in &self.log.contacts {
+            let v = get(c).trim();
+            if v.is_empty() {
+                continue;
+            }
+            match counts.iter_mut().find(|(k, _)| k == v) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((v.to_string(), 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts.into_iter().map(|(k, _)| k).collect()
     }
     fn form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading(if self.editing {
@@ -261,31 +317,81 @@ impl RadioLog {
         Self::field(ui, "Date / time (UTC)", &mut self.draft.datetime);
         ui.horizontal(|ui| {
             ui.small("YYYY-MM-DD HH:MM");
-            if ui.small_button("Set to now").clicked() {
+            if ui.button("Set to now").clicked() {
                 self.draft.datetime = model::now();
             }
         });
-        Self::field(ui, "Callsign / station", &mut self.draft.callsign);
-        Self::field(ui, "Satellite / source", &mut self.draft.satellite);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(140.0);
-                Self::field(ui, "Frequency (MHz)", &mut self.draft.frequency);
+        // A field is hidden only if this type hides it AND the record has nothing in it,
+        // so existing data is never concealed.
+        let known_callsigns = self.known_values(|c| &c.callsign);
+        let known_sources = self.known_values(|c| &c.satellite);
+        let known_modes = self.known_values(|c| &c.mode);
+        let known_locations = self.known_values(|c| &c.location);
+        let kind = self.log.types.iter().find(|t| t.name == self.draft.kind);
+        let show = |key: &str, used: bool| used || !kind.is_some_and(|k| k.hides(key));
+        let d = &self.draft;
+        let show_callsign = show("callsign", !d.callsign.is_empty());
+        let show_satellite = show("satellite", !d.satellite.is_empty());
+        let show_freq = show("frequency", !d.frequency.is_empty());
+        let show_mode = show("mode", !d.mode.is_empty());
+        let show_rst = show("rst", !d.rst_sent.is_empty() || !d.rst_rcvd.is_empty());
+        let show_location = show("location", !d.location.is_empty());
+        let show_recording = show("recording", !d.recording.is_empty());
+        let show_notes = show("notes", !d.notes.is_empty());
+        if show_callsign {
+            Self::field_suggest(
+                ui,
+                "Callsign / station",
+                &mut self.draft.callsign,
+                &known_callsigns,
+            );
+        }
+        if show_satellite {
+            Self::field_suggest(
+                ui,
+                "Satellite / source",
+                &mut self.draft.satellite,
+                &known_sources,
+            );
+        }
+        if show_freq || show_mode {
+            ui.horizontal(|ui| {
+                if show_freq {
+                    ui.vertical(|ui| {
+                        ui.set_width(140.0);
+                        Self::field(ui, "Frequency (MHz)", &mut self.draft.frequency);
+                    });
+                }
+                if show_mode {
+                    ui.vertical(|ui| {
+                        ui.set_width(140.0);
+                        Self::field_suggest(ui, "Mode", &mut self.draft.mode, &known_modes);
+                    });
+                }
             });
-            ui.vertical(|ui| {
-                ui.set_width(140.0);
-                Self::field(ui, "Mode", &mut self.draft.mode);
-            });
-        });
-        ui.horizontal(|ui|{ui.vertical(|ui|{ui.set_width(140.0);Self::field(ui,"RST sent",&mut self.draft.rst_sent);});ui.vertical(|ui|{ui.set_width(140.0);Self::field(ui,"RST received",&mut self.draft.rst_rcvd);});}).response.on_hover_text("Readability, Signal strength, Tone. Voice usually uses two digits, e.g. 59. Leave blank for listening-only entries.");
-        Self::field(ui, "Station location / grid", &mut self.draft.location);
-        Self::field(ui, "Recording file / link", &mut self.draft.recording);
-        ui.label("Notes");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.draft.notes)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+        }
+        if show_rst {
+            ui.horizontal(|ui|{ui.vertical(|ui|{ui.set_width(140.0);Self::field(ui,"RST sent",&mut self.draft.rst_sent);});ui.vertical(|ui|{ui.set_width(140.0);Self::field(ui,"RST received",&mut self.draft.rst_rcvd);});}).response.on_hover_text("Readability, Signal strength, Tone. Voice usually uses two digits, e.g. 59. Leave blank for listening-only entries.");
+        }
+        if show_location {
+            Self::field_suggest(
+                ui,
+                "Station location / grid",
+                &mut self.draft.location,
+                &known_locations,
+            );
+        }
+        if show_recording {
+            Self::field(ui, "Recording file / link", &mut self.draft.recording);
+        }
+        if show_notes {
+            ui.label("Notes");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.draft.notes)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
@@ -303,16 +409,18 @@ impl RadioLog {
             }
         });
         ui.separator();
-        if ui
-            .add_enabled(
-                self.radio_rx.is_none(),
-                egui::Button::new("Autofill from SDR++"),
-            )
-            .clicked()
-        {
-            self.request_radio(ctx);
+        if show_freq || show_mode {
+            if ui
+                .add_enabled(
+                    self.radio_rx.is_none(),
+                    egui::Button::new("Autofill from SDR++"),
+                )
+                .clicked()
+            {
+                self.request_radio(ctx);
+            }
+            ui.small(&self.radio_status);
         }
-        ui.small(&self.radio_status);
         ui.collapsing("SDR++ setup", |ui| {
             ui.label("In SDR++, open Rigctl Server:");
             ui.label("Host: localhost   Port: 4532");
@@ -442,13 +550,12 @@ impl RadioLog {
                                     self.search.clear();
                                 }
                             }
-                            ui.label(
-                                [c.rst_sent.as_str(), c.rst_rcvd.as_str()]
-                                    .into_iter()
-                                    .filter(|s| !s.is_empty())
-                                    .collect::<Vec<_>>()
-                                    .join(" / "),
-                            );
+                            ui.label(match (c.rst_sent.is_empty(), c.rst_rcvd.is_empty()) {
+                                (false, false) => format!("{} / {}", c.rst_sent, c.rst_rcvd),
+                                (false, true) => format!("{} (sent)", c.rst_sent),
+                                (true, false) => format!("{} (received)", c.rst_rcvd),
+                                (true, true) => String::new(),
+                            });
                             if c.location.trim().is_empty() {
                                 ui.label("—");
                             } else if ui.link(&c.location).clicked() {
@@ -464,6 +571,9 @@ impl RadioLog {
                             ui.add(egui::Label::new(&detail).truncate())
                                 .on_hover_text(&detail);
                             ui.horizontal(|ui| {
+                                if ui.button("View").clicked() {
+                                    self.viewing = Some(c.id.clone());
+                                }
                                 if ui.button("Edit").clicked() {
                                     self.draft = c.clone();
                                     self.editing = true;
@@ -476,6 +586,78 @@ impl RadioLog {
                         }
                     });
             });
+    }
+    fn view_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.viewing.clone() else {
+            return;
+        };
+        let Some(c) = self.log.contacts.iter().find(|c| c.id == id).cloned() else {
+            self.viewing = None;
+            return;
+        };
+        let mut open = true;
+        let mut edit = false;
+        egui::Window::new("Contact details")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                let kind_color = self
+                    .log
+                    .types
+                    .iter()
+                    .find(|t| t.name == c.kind)
+                    .map(|t| color(&t.color))
+                    .unwrap_or(Color32::GRAY);
+                ui.label(RichText::new(&c.kind).heading().color(kind_color));
+                ui.add_space(4.0);
+                egui::Grid::new("view-grid")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        let datetime = c.datetime.replace('T', " ");
+                        let kind = self.log.types.iter().find(|t| t.name == c.kind);
+                        for (key, label, value) in [
+                            ("", "Date / time (UTC)", datetime.as_str()),
+                            ("callsign", "Callsign / station", c.callsign.as_str()),
+                            ("satellite", "Satellite / source", c.satellite.as_str()),
+                            ("frequency", "Frequency (MHz)", c.frequency.as_str()),
+                            ("mode", "Mode", c.mode.as_str()),
+                            ("rst", "RST sent", c.rst_sent.as_str()),
+                            ("rst", "RST received", c.rst_rcvd.as_str()),
+                            ("location", "Station location / grid", c.location.as_str()),
+                            ("recording", "Recording file / link", c.recording.as_str()),
+                            ("notes", "Notes", c.notes.as_str()),
+                        ] {
+                            if value.trim().is_empty() && kind.is_some_and(|k| k.hides(key)) {
+                                continue;
+                            }
+                            ui.label(RichText::new(label).color(Color32::from_gray(185)));
+                            if value.trim().is_empty() {
+                                ui.label("—");
+                            } else {
+                                ui.add(egui::Label::new(value).wrap());
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Edit").clicked() {
+                        edit = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.viewing = None;
+                    }
+                });
+            });
+        if edit {
+            self.draft = c;
+            self.editing = true;
+            self.viewing = None;
+        } else if !open {
+            self.viewing = None;
+        }
     }
     fn types_window(&mut self, ctx: &egui::Context) {
         if !self.manage {
@@ -498,10 +680,10 @@ impl RadioLog {
                                     .filter(|c| c.kind == t.name)
                                     .count()
                             ));
-                            if ui.small_button("Rename").clicked() {
+                            if ui.button("Rename").clicked() {
                                 self.rename = Some((t.name.clone(), t.name.clone()));
                             }
-                            if ui.small_button("Colour").clicked() {
+                            if ui.button("Colour").clicked() {
                                 let mut next = self.log.clone();
                                 let item =
                                     next.types.iter_mut().find(|x| x.name == t.name).unwrap();
@@ -517,6 +699,25 @@ impl RadioLog {
                                 .clicked()
                             {
                                 self.pending = Some(Pending::DeleteType(t.name.clone()));
+                            }
+                        });
+                        ui.collapsing(format!("Fields shown for {}", t.name), |ui| {
+                            let mut next = self.log.clone();
+                            let mut changed = false;
+                            let item = next.types.iter_mut().find(|x| x.name == t.name).unwrap();
+                            for (key, label) in model::FIELDS {
+                                let mut shown = !item.hides(key);
+                                if ui.checkbox(&mut shown, label).changed() {
+                                    item.hidden.retain(|h| h != key);
+                                    if !shown {
+                                        item.hidden.push(key.into());
+                                    }
+                                    changed = true;
+                                }
+                            }
+                            ui.small("Hidden fields still appear on records that already use them.");
+                            if changed {
+                                self.commit(next);
                             }
                         });
                     }
@@ -582,10 +783,8 @@ impl RadioLog {
                             self.message = "Use a non-empty, unique type name.".into();
                         } else {
                             let mut next = self.log.clone();
-                            next.types.push(Kind {
-                                name,
-                                color: model::COLORS[self.new_color].into(),
-                            });
+                            next.types
+                                .push(Kind::new(name, model::COLORS[self.new_color].into()));
                             if self.commit(next) {
                                 self.new_type.clear();
                             }
@@ -665,6 +864,7 @@ impl eframe::App for RadioLog {
                 self.entries(ui)
             });
         });
+        self.view_window(ctx);
         self.types_window(ctx);
         self.confirmation(ctx);
     }
